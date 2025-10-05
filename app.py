@@ -13,6 +13,10 @@ from flask import Flask, request
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("1230")
+
 # ========= CONFIG =========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()  # optional: add ?secret=XYZ to webhook URL
@@ -301,10 +305,9 @@ def tilda_webhook():
 # ========= RUN BOTH (Render expects web to bind PORT) =========
 def run_bot():
     logger.info("Starting Telegram polling…")
-    # IMPORTANT: disable signal handlers in a thread
     app_tg.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        stop_signals=None   # <-- this is the key
+        stop_signals=None  # important when running in a thread
     )
 
 @app.route("/", methods=["GET"])
