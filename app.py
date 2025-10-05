@@ -12,7 +12,7 @@ from datetime import datetime
 from flask import Flask, request
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
+import asyncio
 import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("1230")
@@ -305,9 +305,11 @@ def tilda_webhook():
 # ========= RUN BOTH (Render expects web to bind PORT) =========
 def run_bot():
     logger.info("Starting Telegram polling…")
-    app_tg.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None  # important when running in a thread
+    asyncio.run(
+        app_tg.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            stop_signals=None  # safe in a thread
+        )
     )
 
 @app.route("/", methods=["GET"])
@@ -319,8 +321,7 @@ def health():
     return "ok"
 
 if __name__ == "__main__":
-    # start bot in background
     threading.Thread(target=run_bot, daemon=True).start()
-
+    logger.info("Flask starting…")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
