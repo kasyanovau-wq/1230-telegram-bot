@@ -17,6 +17,10 @@ import json
 import asyncio
 import logging
 import threading
+
+import csv
+import io
+
 from datetime import datetime
 
 from flask import Flask, request
@@ -111,8 +115,23 @@ def normalize_email(s: str | None) -> str:
 
 def normalize_phone(s: str | None) -> str:
     s = (s or "").strip()
-    s = re.sub(r"[^\d+]", "", s)  # keep + and digits
-    return s
+    # keep digits and leading +
+    digits = re.sub(r"[^\d+]", "", s)
+
+    # RU-friendly heuristics
+    if digits.startswith("+"):
+        return digits
+    # 11 digits starting with 8 -> +7XXXXXXXXXX
+    if re.fullmatch(r"8\d{10}", digits):
+        return "+7" + digits[1:]
+    # 11 digits starting with 7 -> +7XXXXXXXXXX
+    if re.fullmatch(r"7\d{10}", digits):
+        return "+" + digits
+    # 10 digits starting with 9 -> +7XXXXXXXXXX
+    if re.fullmatch(r"9\d{9}", digits):
+        return "+7" + digits
+    # fallback: return digits (may match if Tilda stored same way)
+    return digits
 
 def link_chat(identifier: str, chat_id: int) -> None:
     bundle = data_store.setdefault(identifier, {"items": {}, "orders": {}})
@@ -348,6 +367,98 @@ def tilda_webhook():
                 logger.error("send_message error: %s", e)
 
     return "ok"
+
+# --- CSV column matching helpers ---
+CSV_EMAIL_KEYS = ["email", "e-mail", "почта"]
+CSV_PHONE_KEYS = ["phone", "телефон"]
+CSV_STATUS_KEYS = ["status", "статус"]
+CSV_ITEM_KEYS = ["item", "product", "товар", "название", "наименование"]
+CSV_ORDERID_KEYS = ["order", "orderid", "заказ", "id", "номер"]
+
+def pick_key(row: dict, candidates: list[str]) -> str | None:
+    lower = {k.lower(): k for k in row.keys()}
+    for want in candidates:
+        for lk, orig in lower.items():
+            if want in lk:
+                return orig
+    return None
+
+def upsert_row(row: dict, kind: str, notify: bool) -> None:
+    # identify user
+    k_email = pick_key(row, CSV_EMAIL_KEYS)
+    k_phone = pick_key(row, CSV_PHONE_KEYS)
+    ident = None
+    if k_email and row.get(k_email):
+        ident = normalize_email(row[k_email])
+    elif k_phone and row.get(k_phone):
+        ident = normalize_phone(row[k_phone])
+    if not ident:
+        return
+
+    # fields
+    k_status = pick_key(row, CSV_STATUS_KEYS)
+    k_item = pick_key(row, CSV_ITEM_KEYS)
+    k_orderid = pick_key(row, CSV_ORDERID_KEYS)
+
+    status = (row.get(k_status) or "").strip() or "Submitted"
+    item_name = (row.get(k_item) or "").strip() or None
+    rec_id = (row.get(k_orderid) or "").strip() or item_name or f"rec-{int(datetime.utcnow().timestamp())}"
+
+    bundle = data_store.setdefault(ident, {"items": {}, "orders": {}})
+    if kind == "item":
+        rec = bundle["items"].setdefault(rec_id, {"name": item_name or f"Item {rec_id}", "status": "Submitted"})
+        if item_name: rec["name"] = item_name
+        rec["status"] = status
+    else:
+        rec = bundle["orders"].setdefault(rec_id, {"item": item_name or f"Order {rec_id}", "status": "Placed"})
+        if item_name: rec["item"] = item_name
+        rec["status"] = status
+
+    save_data()
+
+    if notify and (chat_id := bundle.get("chat_id")):
+        if kind == "item":
+            msg = f"🔔 Update: Your item <b>{html_escape(rec.get('name'))}</b> is now <b>{html_escape(status)}</b>."
+        else:
+            msg = f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(status)}</b>."
+        try:
+            bot.send_message(chat_id, msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error("notify error: %s", e)
+
+            @app.route("/admin/import_csv", methods=["POST"])
+def admin_import_csv():
+    # protect with same secret
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return "forbidden", 403
+
+    kind = (request.args.get("type") or "").strip().lower()
+    if kind not in {"item", "order"}:
+        return "bad type", 400
+
+    notify = (request.args.get("notify") or "false").lower() == "true"
+
+    if "file" not in request.files:
+        return "no file", 400
+
+    f = request.files["file"]
+    content = f.read()
+    if not content:
+        return "empty", 400
+
+    try:
+        text = content.decode("utf-8-sig")  # handle BOM if present
+        reader = csv.DictReader(io.StringIO(text))
+        count = 0
+        for row in reader:
+            if not isinstance(row, dict):
+                continue
+            upsert_row(row, kind, notify)
+            count += 1
+        return f"ok,{count}"
+    except Exception as e:
+        logger.error("import_csv error: %s", e)
+        return "error", 500
 
 # =========================
 # RUN: Flask in a thread, Bot in MAIN (asyncio-friendly)
