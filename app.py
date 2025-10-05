@@ -311,14 +311,40 @@ def admin_import_csv():
         return "file too large", 413
 
     try:
-        text = f.read().decode("utf-8-sig", errors="ignore")
-        reader = csv.DictReader(io.StringIO(text))
+        raw = f.read()
+        # try common encodings (handles BOM & Cyrillic)
+        text = None
+        for enc in ("utf-8-sig", "utf-8", "cp1251", "windows-1251", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except Exception:
+                continue
+        if text is None:
+            return "decode error", 415
+
+        # Auto-detect delimiter (comma, semicolon, tab); fallback to ; then ,
+        sample = text[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t"])
+            reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+        except Exception:
+            try:
+                reader = csv.DictReader(io.StringIO(text), delimiter=";")
+            except Exception:
+                reader = csv.DictReader(io.StringIO(text), delimiter=",")
+
         count = 0
         for row in reader:
-            if isinstance(row, dict): upsert_row(row, kind, notify=False); count += 1
+            # skip rows that are completely empty
+            if not isinstance(row, dict) or not any((v or "").strip() for v in row.values()):
+                continue
+            upsert_row(row, kind, notify=False)
+            count += 1
         return f"ok,{count}"
     except Exception as e:
-        logger.error("import_csv error: %s", e); return "error", 500
+        # temporary debug — helps us see what's wrong if any
+        return f"error: {type(e).__name__}: {e}", 500
 
 app.add_url_rule(ADMIN_IMPORT_PATH, view_func=admin_import_csv, methods=["POST"])
 
