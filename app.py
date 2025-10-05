@@ -410,6 +410,9 @@ def run_flask():
     app.run(host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
+    # Start Flask in background
     threading.Thread(target=run_flask, daemon=True).start()
+
+    # Start Telegram polling in MAIN thread (no asyncio.run here)
     logger.info("Starting Telegram polling…")
-    asyncio.run(app_tg.run_polling(allowed_updates=Update.ALL_TYPES))
+    app_tg.run_polling(allowed_updates=Update.ALL_TYPES)
