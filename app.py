@@ -300,7 +300,20 @@ def tilda_webhook():
 
 # ========= RUN BOTH (Render expects web to bind PORT) =========
 def run_bot():
-    app_tg.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting Telegram polling…")
+    # IMPORTANT: disable signal handlers in a thread
+    app_tg.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        stop_signals=None   # <-- this is the key
+    )
+
+@app.route("/", methods=["GET"])
+def root():
+    return "ok"
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok"
 
 if __name__ == "__main__":
     # start bot in background
