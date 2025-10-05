@@ -99,10 +99,25 @@ def find_user_key_by_chat(chat_id: int):
 
 def build_status_lines(info: dict) -> list[str]:
     lines = []
-    for rec_id, rec in (info.get("items") or {}).items():
-        lines.append(f"📦 <b>Item:</b> {html_escape(rec.get('name') or f'Item {rec_id}')} — <b>{html_escape(rec.get('status') or 'Unknown')}</b>")
-    for rec_id, rec in (info.get("orders") or {}).items():
-        lines.append(f"🛒 <b>Order:</b> {html_escape(rec.get('item') or f'Order {rec_id}')} — <b>{html_escape(rec.get('status') or 'Unknown')}</b>")
+    items = (info or {}).get("items", {})
+    orders = (info or {}).get("orders", {})
+
+    if items:
+        lines.append("<b>🧾 Your selling items</b>")
+        for rec_id, rec in items.items():
+            name = html_escape(rec.get("name") or f"Item {rec_id}")
+            status = html_escape(rec.get("status") or "Unknown")
+            lines.append(f"• {name} — <b>{status}</b>")
+
+    if orders:
+        if lines:  # add a blank line between sections
+            lines.append("")
+        lines.append("<b>🛍️ Your orders</b>")
+        for rec_id, rec in orders.items():
+            item_name = html_escape(rec.get("item") or f"Order {rec_id}")
+            status = html_escape(rec.get("status") or "Unknown")
+            lines.append(f"• {item_name} — <b>{status}</b>")
+
     return lines
 
 # -------- telegram (PTB v21) --------
@@ -260,38 +275,79 @@ def check_auth_header(req) -> bool:
     return req.headers.get("Authorization", "") == f"Bearer {AUTH_TOKEN}"
 
 def upsert_row(row: dict, kind: str, notify: bool):
+    # ---------- identify the user (email first, then phone) ----------
     k_email = pick_key(row, CSV_EMAIL_KEYS)
     k_phone = pick_key(row, CSV_PHONE_KEYS)
     ident = None
-    if k_email and row.get(k_email): ident = normalize_email(row[k_email])
-    elif k_phone and row.get(k_phone): ident = normalize_phone(row[k_phone])
-    if not ident: return
+    if k_email and row.get(k_email):
+        ident = normalize_email(row[k_email])
+    elif k_phone and row.get(k_phone):
+        ident = normalize_phone(row[k_phone])
+    if not ident:
+        return  # can't link to a chat later without an identifier
 
-    k_status  = pick_key(row, CSV_STATUS_KEYS)
-    k_item    = pick_key(row, CSV_ITEM_KEYS)
-    k_orderid = pick_key(row, CSV_ORDERID_KEYS)
+    # ---------- find fields in this CSV row ----------
+    k_status   = pick_key(row, CSV_STATUS_KEYS)  # common aliases like "status", "статус"
+    k_item     = pick_key(row, CSV_ITEM_KEYS)    # "item", "product", "товар", ...
+    k_orderid  = pick_key(row, CSV_ORDERID_KEYS) # "order", "orderid", "заказ", ...
 
-    status   = (row.get(k_status) or "").strip() or "Submitted"
-    itemname = (row.get(k_item) or "").strip() or None
-    rec_id   = (row.get(k_orderid) or "").strip() or itemname or f"rec-{int(datetime.utcnow().timestamp())}"
+    # Prefer human-readable Stage if present; otherwise fall back to status/statusid/etc.
+    status = None
+    for key in row.keys():
+        lk = key.strip().lower()
+        if lk == "stage":  # Tilda board column name (human text)
+            status = (row[key] or "").strip()
+            break
+    if not status:
+        status = (row.get(k_status) or "").strip() if k_status else ""
+    if not status:
+        # extra fallbacks that sometimes appear in Tilda exports
+        status = (row.get("statusid") or row.get("pipeline") or row.get("pipeline_stage") or "").strip()
+    if not status:
+        status = "Submitted"
 
+    # Item/Order display name:
+    itemname = (row.get(k_item) or "").strip() if k_item else ""
+    if not itemname:
+        # Build from Brand + Size if present
+        k_brand = pick_key(row, ["brand", "бренд"])
+        k_size  = pick_key(row, ["size", "размер"])
+        brand = (row.get(k_brand) or "").strip() if k_brand else ""
+        size  = (row.get(k_size)  or "").strip() if k_size  else ""
+        combo = " ".join([p for p in [brand, size] if p])
+        itemname = combo if combo else None
+
+    # Record ID: prefer explicit ids (tranid/order id), else item name, else timestamp
+    tranid = (row.get("tranid") or row.get("leadid") or row.get("leads_id") or "").strip()
+    order_id_val = (row.get(k_orderid) or "").strip() if k_orderid else ""
+    rec_id = tranid or order_id_val or (itemname or "").strip() or f"rec-{int(datetime.utcnow().timestamp())}"
+
+    # ---------- upsert into our store ----------
     bundle = data_store.setdefault(ident, {"items": {}, "orders": {}})
     if kind == "item":
         rec = bundle["items"].setdefault(rec_id, {"name": itemname or f"Item {rec_id}", "status": "Submitted"})
-        if itemname: rec["name"] = itemname
+        if itemname:
+            rec["name"] = itemname
         rec["status"] = status
     else:
         rec = bundle["orders"].setdefault(rec_id, {"item": itemname or f"Order {rec_id}", "status": "Placed"})
-        if itemname: rec["item"] = itemname
+        if itemname:
+            rec["item"] = itemname
         rec["status"] = status
+
     save_data()
 
+    # ---------- optional notify ----------
     if notify and (chat_id := bundle.get("chat_id")):
-        msg = (f"🔔 Update: Your item <b>{html_escape(rec.get('name'))}</b> is now <b>{html_escape(status)}</b>."
-               if kind=="item" else
-               f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(status)}</b>.")
-        try: bot.send_message(chat_id, msg, parse_mode="HTML")
-        except Exception as e: logger.error("notify error: %s", e)
+        msg = (
+            f"🔔 Update: Your item <b>{html_escape(rec.get('name'))}</b> is now <b>{html_escape(status)}</b>."
+            if kind == "item" else
+            f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(status)}</b>."
+        )
+        try:
+            bot.send_message(chat_id, msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error("notify error: %s", e)
 
 ADMIN_IMPORT_PATH = f"/admin/{ADMIN_PATH}/import_csv"
 
