@@ -7,87 +7,144 @@ Original file is located at
     https://colab.research.google.com/drive/1Br1KHaNsVETs8ZpGah8VmaHxrcgHt_Hi
 """
 
-import os, json, threading, re
-from datetime import datetime
-from flask import Flask, request
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+# app.py
+# 12:30 Resale — Telegram Bot + Flask webhook (Render-ready)
+# PTB v21+, Flask 3.x
+
+import os
+import re
+import json
 import asyncio
 import logging
+import threading
+from datetime import datetime
+
+from flask import Flask, request
+
+from telegram import (
+    Update,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Bot,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# =========================
+# ENV / CONFIG
+# =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("1230")
 
-# ========= CONFIG =========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()  # optional: add ?secret=XYZ to webhook URL
-ADMIN_USER_IDS = set([int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()])
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()  # add as ?secret=... to the webhook URL
+ADMIN_USER_IDS = {
+    int(x)
+    for x in os.environ.get("ADMIN_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 
-assert BOT_TOKEN, "BOT_TOKEN env var is required"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env var is required")
 
-DATA_FILE = "data.json"   # lightweight persistence
-LOCK = threading.Lock()   # to guard data file writes
-
-# ========= DATA STORE =========
-# Structure:
-# {
-#   "<identifier>": {  # email or phone
-#       "chat_id": 123456789,
-#       "items": { "<recordId>": {"name": "...", "status": "..."} },
-#       "orders": { "<recordId>": {"item": "...", "status": "..."} }
-#   },
-#   ...
-# }
-data_store = {}
-
-def load_data():
-    global data_store
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data_store = json.load(f)
-    except FileNotFoundError:
-        data_store = {}
-    except Exception as e:
-        print("Failed to load data.json:", e)
-        data_store = {}
-
-def save_data():
-    with LOCK:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data_store, f, ensure_ascii=False, indent=2)
-
-load_data()
-
-# ========= TELEGRAM BOT =========
-app_tg = Application.builder().token(BOT_TOKEN).build()
-bot = Bot(token=BOT_TOKEN)
+DATA_FILE = "data.json"          # lightweight persistence (JSON on disk)
+LOCK = threading.Lock()          # guard concurrent writes
 
 WELCOME = (
     "Hi! 👋 To find your items/orders, please *share your phone* or *type your email*.\n"
     "Then send /status anytime to get updates."
 )
 
-def html_escape(text: str) -> str:
+# =========================
+# LIGHTWEIGHT STORAGE
+# =========================
+# Structure:
+# {
+#   "<email or phone>": {
+#       "chat_id": 123456789,
+#       "items":  { "<rec_id>": {"name": "...", "status": "..."} },
+#       "orders": { "<rec_id>": {"item": "...", "status": "..."} }
+#   },
+#   ...
+# }
+data_store: dict = {}
+
+def load_data() -> None:
+    global data_store
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data_store = json.load(f)
+            if not isinstance(data_store, dict):
+                data_store = {}
+    except FileNotFoundError:
+        data_store = {}
+    except Exception as e:
+        logger.warning("Failed to load %s: %s", DATA_FILE, e)
+        data_store = {}
+
+def save_data() -> None:
+    with LOCK:
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(data_store, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error("Failed to save %s: %s", DATA_FILE, e)
+
+load_data()
+
+# =========================
+# TELEGRAM (PTB v21)
+# =========================
+app_tg = Application.builder().token(BOT_TOKEN).build()
+bot = Bot(token=BOT_TOKEN)  # used inside Flask thread for notifications
+
+def html_escape(text: str | None) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def normalize_email(s: str) -> str:
+def normalize_email(s: str | None) -> str:
     return (s or "").strip().lower()
 
-def normalize_phone(s: str) -> str:
+def normalize_phone(s: str | None) -> str:
     s = (s or "").strip()
-    # keep leading + and digits
-    s = re.sub(r"[^\d+]", "", s)
-    # ensure single leading +
-    if s and s[0] != "+":
-        # naive: assume international not guaranteed; keep as digits if no +
-        pass
+    s = re.sub(r"[^\d+]", "", s)  # keep + and digits
     return s
 
+def link_chat(identifier: str, chat_id: int) -> None:
+    bundle = data_store.setdefault(identifier, {"items": {}, "orders": {}})
+    bundle["chat_id"] = chat_id
+    save_data()
+
+def find_user_key_by_chat(chat_id: int) -> str | None:
+    for key, payload in data_store.items():
+        if payload.get("chat_id") == chat_id:
+            return key
+    return None
+
+def build_status_lines(info: dict) -> list[str]:
+    lines: list[str] = []
+    for rec_id, rec in (info.get("items") or {}).items():
+        name = html_escape(rec.get("name") or f"Item {rec_id}")
+        status = html_escape(rec.get("status") or "Unknown")
+        lines.append(f"📦 <b>Item:</b> {name} — <b>{status}</b>")
+    for rec_id, rec in (info.get("orders") or {}).items():
+        item_name = html_escape(rec.get("item") or f"Order {rec_id}")
+        status = html_escape(rec.get("status") or "Unknown")
+        lines.append(f"🛒 <b>Order:</b> {item_name} — <b>{status}</b>")
+    return lines
+
+# --- Handlers ---
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Received /start from chat_id=%s", update.effective_chat.id)
     kb = [[KeyboardButton("📱 Share my phone", request_contact=True)]]
     await update.message.reply_text(
         WELCOME,
         reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,59 +155,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(Admins) /update_status <item|order> <recordId> <new status>"
     )
 
-def link_chat(identifier: str, chat_id: int):
-    if identifier not in data_store:
-        data_store[identifier] = {"items": {}, "orders": {}}
-    data_store[identifier]["chat_id"] = chat_id
-    save_data()
-
-def find_user_key_by_chat(chat_id: int):
-    for key, payload in data_store.items():
-        if payload.get("chat_id") == chat_id:
-            return key
-    return None
-
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.contact
-    phone = normalize_phone(contact.phone_number)
-    link_chat(phone, update.effective_chat.id)
-    await update.message.reply_text("✅ Phone linked. Send /status to see updates.")
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # treat any non-command text as potential email
-    text = (update.message.text or "").strip()
-    if "@" in text and "." in text:
-        email = normalize_email(text)
-        link_chat(email, update.effective_chat.id)
-        await update.message.reply_text(f"✅ Email {email} linked. Send /status to see updates.")
-    else:
-        await update.message.reply_text(
-            "Please send a valid email (like name@example.com) or tap the phone button via /start."
-        )
-
-def build_status_lines(info: dict):
-    lines = []
-    # Items (seller)
-    items = (info or {}).get("items", {})
-    for rec_id, rec in items.items():
-        name = html_escape(rec.get("name") or f"Item {rec_id}")
-        status = html_escape(rec.get("status") or "Unknown")
-        lines.append(f"📦 <b>Item:</b> {name} — <b>{status}</b>")
-    # Orders (buyer)
-    orders = (info or {}).get("orders", {})
-    for rec_id, rec in orders.items():
-        item_name = html_escape(rec.get("item") or f"Order {rec_id}")
-        status = html_escape(rec.get("status") or "Unknown")
-        lines.append(f"🛒 <b>Order:</b> {item_name} — <b>{status}</b>")
-    return lines
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_key = find_user_key_by_chat(chat_id)
-    if not user_key:
+    key = find_user_key_by_chat(chat_id)
+    if not key:
         await update.message.reply_text("I don’t know you yet. Use /start and share phone or type your email.")
         return
-    info = data_store.get(user_key, {})
+    info = data_store.get(key, {})
     lines = build_status_lines(info)
     if not lines:
         await update.message.reply_text("No items or orders found yet.")
@@ -158,7 +169,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("\n".join(lines))
 
 async def cmd_update_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Admin only; format: /update_status <item|order> <recordId> <new status...>
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         return
@@ -168,56 +178,92 @@ async def cmd_update_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     kind, rec_id = args[0].lower(), args[1]
     new_status = " ".join(args[2:])
-    # find rec in all users
     found = False
     for ident, bundle in data_store.items():
         if kind == "item" and rec_id in bundle.get("items", {}):
             bundle["items"][rec_id]["status"] = new_status
             save_data()
             found = True
-            chat_id = bundle.get("chat_id")
-            if chat_id:
-                msg = f"🔔 Update: Your item <b>{html_escape(bundle['items'][rec_id].get('name'))}</b> is now <b>{html_escape(new_status)}</b>."
+            if (chat_id := bundle.get("chat_id")):
+                msg = (
+                    f"🔔 Update: Your item <b>{html_escape(bundle['items'][rec_id].get('name'))}</b> "
+                    f"is now <b>{html_escape(new_status)}</b>."
+                )
                 await app_tg.bot.send_message(chat_id, msg, parse_mode="HTML")
             break
         if kind == "order" and rec_id in bundle.get("orders", {}):
             bundle["orders"][rec_id]["status"] = new_status
             save_data()
             found = True
-            chat_id = bundle.get("chat_id")
-            if chat_id:
-                msg = f"🔔 Update: Your order <b>{html_escape(bundle['orders'][rec_id].get('item'))}</b> is now <b>{html_escape(new_status)}</b>."
+            if (chat_id := bundle.get("chat_id")):
+                msg = (
+                    f"🔔 Update: Your order <b>{html_escape(bundle['orders'][rec_id].get('item'))}</b> "
+                    f"is now <b>{html_escape(new_status)}</b>."
+                )
                 await app_tg.bot.send_message(chat_id, msg, parse_mode="HTML")
             break
     await update.message.reply_text("OK" if found else "Not found")
 
-# Register handlers
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = normalize_phone(update.message.contact.phone_number)
+    link_chat(phone, update.effective_chat.id)
+    await update.message.reply_text("✅ Phone linked. Send /status to see updates.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if "@" in text and "." in text:
+        email = normalize_email(text)
+        link_chat(email, update.effective_chat.id)
+        await update.message.reply_text(f"✅ Email {email} linked. Send /status to see updates.")
+    else:
+        await update.message.reply_text("Please send a valid email (like name@example.com) or tap the phone button via /start.")
+
+# --- Debug helpers so we SEE incoming updates & errors ---
+async def _log_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    who = update.effective_user.id if update.effective_user else None
+    txt = update.message.text if update.message else None
+    logger.info("UPDATE IN: user=%s text=%s", who, txt)
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("ERROR: %s", context.error)
+
+# Register handlers (order matters: specific first, then catch-all)
 app_tg.add_handler(CommandHandler("start", cmd_start))
 app_tg.add_handler(CommandHandler("help", cmd_help))
 app_tg.add_handler(CommandHandler("status", cmd_status))
 app_tg.add_handler(CommandHandler("update_status", cmd_update_status))
 app_tg.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+app_tg.add_handler(MessageHandler(filters.ALL, _log_any))
+app_tg.add_error_handler(_on_error)
 
-# ========= FLASK (Tilda Webhook) =========
+# =========================
+# FLASK (Tilda Webhook)
+# =========================
 app = Flask(__name__)
 
-def kv_find(data: dict, *needle_parts):
-    """Find first key whose name contains all needle_parts (case-insensitive)."""
+@app.route("/", methods=["GET"])
+def root():
+    return "ok"
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok"
+
+def kv_find(data: dict, *needle_parts: str) -> str | None:
+    """Find first key containing all parts (case-insensitive)."""
     for k in data.keys():
         name = k.lower()
         if all(part in name for part in needle_parts):
             return k
     return None
 
-def upsert_record_from_tilda(payload: dict):
+def upsert_record_from_tilda(payload: dict) -> tuple[str | None, str | None, str | None]:
     """
-    Heuristic parser:
-    - identifier: email or phone
-    - kind: item vs order guessed by presence of item/product vs order keywords
-    - id: tranid or orderid or composed key
+    Heuristic parser for Tilda form payload.
+    Returns (identifier, kind, record_id).
     """
-    # choose identifier
+    # identifier: prefer email, else phone
     k_email = kv_find(payload, "email")
     k_phone = kv_find(payload, "phone")
     identifier = None
@@ -225,67 +271,68 @@ def upsert_record_from_tilda(payload: dict):
         identifier = normalize_email(payload.get(k_email))
     elif k_phone and payload.get(k_phone):
         identifier = normalize_phone(payload.get(k_phone))
-
     if not identifier:
-        return None, None, None  # cannot link
+        return None, None, None
 
-    # detect status
+    # status
     k_status = kv_find(payload, "status")
     status = (payload.get(k_status) if k_status else None) or "Submitted"
 
-    # detect item/order naming
+    # item/order fields
     k_item = kv_find(payload, "item") or kv_find(payload, "product")
     item_name = payload.get(k_item) if k_item else None
 
     k_orderid = kv_find(payload, "order")  # matches order/orderid
     order_id_val = payload.get(k_orderid) if k_orderid else None
 
-    # Tilda tranid (lead id)
     tranid = payload.get("tranid") or payload.get("leadid") or payload.get("leads_id")
 
-    # Decide kind
+    # decide kind
     kind = "item"
     if k_orderid and not k_item:
         kind = "order"
 
-    # Record ID
-    rec_id = (tranid or order_id_val or item_name or f"rec-{int(datetime.utcnow().timestamp())}")
+    # make a record id
+    rec_id = tranid or order_id_val or item_name or f"rec-{int(datetime.utcnow().timestamp())}"
 
-    # Upsert
+    # upsert into store
     bundle = data_store.setdefault(identifier, {"items": {}, "orders": {}})
     if kind == "item":
         rec = bundle["items"].setdefault(rec_id, {"name": item_name or f"Item {rec_id}", "status": "Submitted"})
-        # update fields
-        if item_name: rec["name"] = item_name
-        if status: rec["status"] = status
+        if item_name:
+            rec["name"] = item_name
+        if status:
+            rec["status"] = status
     else:
         rec = bundle["orders"].setdefault(rec_id, {"item": item_name or f"Order {rec_id}", "status": "Placed"})
-        if item_name: rec["item"] = item_name
-        if status: rec["status"] = status
+        if item_name:
+            rec["item"] = item_name
+        if status:
+            rec["status"] = status
 
     save_data()
     return identifier, kind, rec_id
 
 @app.route("/tilda_webhook", methods=["POST"])
 def tilda_webhook():
-    if WEBHOOK_SECRET:
-        if request.args.get("secret") != WEBHOOK_SECRET:
-            return "forbidden", 403
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return "forbidden", 403
 
-    # Accept both form-encoded and JSON
-    data = {}
+    # accept form-encoded or JSON
+    payload = {}
     try:
         if request.form:
-            data = request.form.to_dict(flat=True)
+            payload = request.form.to_dict(flat=True)
         elif request.is_json:
-            data = request.get_json(force=True) or {}
-    except Exception:
-        data = {}
+            payload = request.get_json(force=True) or {}
+    except Exception as e:
+        logger.warning("Webhook payload parse error: %s", e)
+        payload = {}
 
-    ident, kind, rec_id = upsert_record_from_tilda(data)
+    ident, kind, rec_id = upsert_record_from_tilda(payload)
 
-    # Notify user if we can
-    if ident and rec_id:
+    # if we know the user's chat, push a notification
+    if ident and kind and rec_id:
         bundle = data_store.get(ident, {})
         chat_id = bundle.get("chat_id")
         if chat_id:
@@ -298,30 +345,27 @@ def tilda_webhook():
             try:
                 bot.send_message(chat_id, msg, parse_mode="HTML")
             except Exception as e:
-                print("send_message error:", e)
+                logger.error("send_message error: %s", e)
 
     return "ok"
 
-# ========= RUN BOTH (Render expects web to bind PORT) =========
-def run_bot():
+# =========================
+# RUN: Flask in a thread, Bot in MAIN (asyncio-friendly)
+# =========================
+def run_flask():
+    logger.info("Flask starting…")
+    port = int(os.environ.get("PORT", "5000"))
+    # Flask dev server is fine for MVP on Render
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    # 1) start Flask (webhook) in background
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # 2) run Telegram polling in MAIN thread (best with PTB v21+)
     logger.info("Starting Telegram polling…")
     asyncio.run(
         app_tg.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            stop_signals=None  # safe in a thread
+            allowed_updates=Update.ALL_TYPES
         )
     )
-
-@app.route("/", methods=["GET"])
-def root():
-    return "ok"
-
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok"
-
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    logger.info("Flask starting…")
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
