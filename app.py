@@ -31,7 +31,8 @@ if not AUTH_TOKEN:
 if not ADMIN_PATH:
     raise RuntimeError("ADMIN_PATH is required")
 
-DATA_FILE = "data.json"
+DATA_FILE = os.environ.get("DATA_FILE", "/data/data.json")
+
 LOCK = threading.Lock()
 
 WELCOME = (
