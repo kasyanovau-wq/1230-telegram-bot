@@ -37,12 +37,23 @@ DATA_FILE = os.environ.get("DATA_FILE", "/data/data.json")
 LOCK = threading.Lock()
 
 WELCOME = (
-    "Hi! 👋 To find your items/orders, please *type your email* (recommended) or share your phone.\n"
-    "Then send /status anytime to get updates."
+    "Привет! 👋 Чтобы найти твои товары и заказы, отправь *email*, указанный ранее на сайте"
+    "и поделись телефоном.\n\n"
+    "Эта информация конфиденциальна,"
+    "Но мы все равно должны предупредить — пользуясь ботом, ты даешь согласие на обработку персональных данных"
+    "Ознакомиться с согласием можно по ссылке https://12-30.ru/consent"
 )
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[KeyboardButton("📱 Поделиться телефоном", request_contact=True)]]
+    await update.message.reply_text(
+        WELCOME,
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+
 # -------- storage --------
-# { "<email|phone>": { "chat_id": 123, "items": {rec:{name,status}}, "orders": {rec:{item,status}} } }
+# { "<email|phone>": { "chat_id": 123, "items": {rec:{name,status}}, "orders": {rec:{item,status,tracking}} } }
 data_store: dict = {}
 
 def load_data():
@@ -72,8 +83,6 @@ load_data()
 def html_escape(s: str | None) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-import re
-
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
 PHONE_RE_RAW = re.compile(r"^[+]?(\d[\s\-()]*){10,15}$")  # coarse: digits with optional + and separators
 
@@ -85,9 +94,7 @@ def is_phone(s: str | None) -> bool:
     s = (s or "").strip()
     if not PHONE_RE_RAW.match(s):
         return False
-    # keep only digits and +
     digits = re.sub(r"[^\d+]", "", s)
-    # Accept +7XXXXXXXXXX, 7XXXXXXXXXX, 8XXXXXXXXXX (RU)
     if digits.startswith("+7") and len(digits) == 12:
         return True
     if digits.startswith("7") and len(digits) == 11:
@@ -102,14 +109,12 @@ def normalize_email(s: str | None) -> str:
 def normalize_phone(s: str | None) -> str:
     s = (s or "").strip()
     digits = re.sub(r"[^\d+]", "", s)
-    # Normalize to +7XXXXXXXXXX
     if digits.startswith("+7") and len(digits) == 12:
         return digits
     if digits.startswith("7") and len(digits) == 11:
         return "+" + digits
     if digits.startswith("8") and len(digits) == 11:
         return "+7" + digits[1:]
-    # fallback (don’t accept as valid phone elsewhere)
     return digits
 
 def link_chat(identifier: str, chat_id: int):
@@ -120,7 +125,7 @@ def link_chat(identifier: str, chat_id: int):
     save_data()
 
 def idents_for_chat(chat_id: int) -> list[str]:
-    """Return all identifiers (email/phone) mapped to this chat_id."""
+    """Return all identifiers (email/phone) mapped to this chat."""
     return [k for k, v in data_store.items() if v.get("chat_id") == chat_id]
 
 def aggregate_status_for_chat(chat_id: int) -> dict:
@@ -132,40 +137,43 @@ def aggregate_status_for_chat(chat_id: int) -> dict:
         orders.update(b.get("orders", {}))
     return {"items": items, "orders": orders}
 
+# ---------- (2) Status rendering: two sections + tracking in BUY ----------
 def build_status_lines(info: dict) -> list[str]:
     lines = []
-    items = (info or {}).get("items", {})
-    orders = (info or {}).get("orders", {})
+    items = (info or {}).get("items", {})   # SELL
+    orders = (info or {}).get("orders", {}) # BUY
 
+    # SELL section
+    lines.append("<b>🧾 Товары на продажу</b>")
     if items:
-        lines.append("<b>🧾 Your selling items</b>")
         for rec_id, rec in items.items():
             name = html_escape(rec.get("name") or f"Item {rec_id}")
             status = html_escape(rec.get("status") or "Unknown")
             lines.append(f"• {name} — <b>{status}</b>")
+    else:
+        lines.append("• Нет данных")
 
+    lines.append("")  # separator
+
+    # BUY section
+    lines.append("<b>🛍️ Ваши заказы (покупки)</b>")
     if orders:
-        if lines:  # add a blank line between sections
-            lines.append("")
-        lines.append("<b>🛍️ Your orders</b>")
         for rec_id, rec in orders.items():
             item_name = html_escape(rec.get("item") or f"Order {rec_id}")
             status = html_escape(rec.get("status") or "Unknown")
-            lines.append(f"• {item_name} — <b>{status}</b>")
+            track = (rec.get("tracking") or "").strip()
+            if track:
+                lines.append(f"• {item_name} — <b>{status}</b> (Трек: {html_escape(track)})")
+            else:
+                lines.append(f"• {item_name} — <b>{status}</b>")
+    else:
+        lines.append("• Нет данных")
 
     return lines
 
 # -------- telegram (PTB v21) --------
 app_tg = Application.builder().token(BOT_TOKEN).build()
 bot    = Bot(token=BOT_TOKEN)
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[KeyboardButton("📱 Share my phone", request_contact=True)]]
-    await update.message.reply_text(
-        WELCOME,
-        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -228,6 +236,10 @@ def kv_find(data: dict, *needles: str):
             return k
     return None
 
+# keys for tracking across webhook/CSV
+TRACK_KEYS = ["трек номер", "трек-номер", "трек", "tracking", "trackingnumber", "tracking_number"]
+
+# ---------- (3a) Webhook upsert: capture tracking ----------
 def upsert_from_payload(payload: dict):
     # explicit pick
     email_key = next((k for k in payload.keys() if k.lower() in ("email","e-mail","почта")), None)
@@ -255,6 +267,10 @@ def upsert_from_payload(payload: dict):
     item_key = next((k for k in payload.keys() if k.lower() in ("item","product","товар","наименование","название")), None)
     order_key = next((k for k in payload.keys() if k.lower() in ("order","orderid","заказ","номер","id")), None)
 
+    # tracking
+    track_key = next((k for k in payload.keys() if any(t in k.lower() for t in TRACK_KEYS)), None)
+    tracking = (payload.get(track_key) or "").strip() if track_key else ""
+
     item_name = (payload.get(item_key) or "").strip() if item_key else ""
     order_id  = (payload.get(order_key) or "").strip() if order_key else ""
     tranid    = (payload.get("tranid") or payload.get("leadid") or payload.get("leads_id") or "").strip()
@@ -271,6 +287,8 @@ def upsert_from_payload(payload: dict):
         rec = bundle["orders"].setdefault(rec_id, {"item": item_name or f"Order {rec_id}", "status": "Placed"})
         if item_name: rec["item"] = item_name
         rec["status"] = status
+        if tracking:
+            rec["tracking"] = tracking
     save_data()
     return ident, kind, rec_id
 
@@ -294,13 +312,18 @@ def tilda_webhook():
         bundle = data_store.get(ident, {})
         chat_id = bundle.get("chat_id")
         if chat_id:
-            if kind == "item":
-                rec = bundle["items"][rec_id]
-                msg = f"🔔 Update: Your item <b>{html_escape(rec.get('name'))}</b> is now <b>{html_escape(rec.get('status'))}</b>."
-            else:
-                rec = bundle["orders"][rec_id]
-                msg = f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(rec.get('status'))}</b>."
             try:
+                if kind == "item":
+                    rec = bundle["items"][rec_id]
+                    msg = f"🔔 Update: Your item <b>{html_escape(rec.get('name'))}</b> is now <b>{html_escape(rec.get('status'))}</b>."
+                else:
+                    rec = bundle["orders"][rec_id]
+                    track = (rec.get("tracking") or "").strip()
+                    msg = (
+                        f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(rec.get('status'))}</b>"
+                        + (f" (Трек: {html_escape(track)})" if track else "")
+                        + "."
+                    )
                 bot.send_message(chat_id, msg, parse_mode="HTML")
             except Exception as e:
                 logger.error("send_message error: %s", e)
@@ -327,6 +350,7 @@ def pick_key(row: dict, candidates: list[str]) -> str | None:
 def check_auth_header(req) -> bool:
     return req.headers.get("Authorization", "") == f"Bearer {AUTH_TOKEN}"
 
+# ---------- (3b) CSV upsert: capture tracking ----------
 def upsert_row(row: dict, kind: str, notify: bool):
     # ----- identify strictly by explicit columns -----
     keys = {k.lower(): k for k in row.keys()}
@@ -342,21 +366,20 @@ def upsert_row(row: dict, kind: str, notify: bool):
         return
 
     # ---------- find fields in this CSV row ----------
-    k_status   = pick_key(row, CSV_STATUS_KEYS)  # common aliases like "status", "статус"
-    k_item     = pick_key(row, CSV_ITEM_KEYS)    # "item", "product", "товар", ...
-    k_orderid  = pick_key(row, CSV_ORDERID_KEYS) # "order", "orderid", "заказ", ...
+    k_status   = pick_key(row, CSV_STATUS_KEYS)
+    k_item     = pick_key(row, CSV_ITEM_KEYS)
+    k_orderid  = pick_key(row, CSV_ORDERID_KEYS)
 
     # Prefer human-readable Stage if present; otherwise fall back to status/statusid/etc.
     status = None
     for key in row.keys():
         lk = key.strip().lower()
-        if lk == "stage":  # Tilda board column name (human text)
+        if lk == "stage":
             status = (row[key] or "").strip()
             break
     if not status:
         status = (row.get(k_status) or "").strip() if k_status else ""
     if not status:
-        # extra fallbacks that sometimes appear in Tilda exports
         status = (row.get("statusid") or row.get("pipeline") or row.get("pipeline_stage") or "").strip()
     if not status:
         status = "Submitted"
@@ -364,7 +387,6 @@ def upsert_row(row: dict, kind: str, notify: bool):
     # Item/Order display name:
     itemname = (row.get(k_item) or "").strip() if k_item else ""
     if not itemname:
-        # Build from Brand + Size if present
         k_brand = pick_key(row, ["brand", "бренд"])
         k_size  = pick_key(row, ["size", "размер"])
         brand = (row.get(k_brand) or "").strip() if k_brand else ""
@@ -376,6 +398,10 @@ def upsert_row(row: dict, kind: str, notify: bool):
     tranid = (row.get("tranid") or row.get("leadid") or row.get("leads_id") or "").strip()
     order_id_val = (row.get(k_orderid) or "").strip() if k_orderid else ""
     rec_id = tranid or order_id_val or (itemname or "").strip() or f"rec-{int(datetime.utcnow().timestamp())}"
+
+    # Tracking (BUY list only)
+    k_track = pick_key(row, TRACK_KEYS)
+    tracking = (row.get(k_track) or "").strip() if k_track else ""
 
     # ---------- upsert into our store ----------
     bundle = data_store.setdefault(ident, {"items": {}, "orders": {}})
@@ -389,6 +415,8 @@ def upsert_row(row: dict, kind: str, notify: bool):
         if itemname:
             rec["item"] = itemname
         rec["status"] = status
+        if tracking:
+            rec["tracking"] = tracking
 
     save_data()
 
@@ -397,7 +425,9 @@ def upsert_row(row: dict, kind: str, notify: bool):
         msg = (
             f"🔔 Update: Your item <b>{html_escape(rec.get('name'))}</b> is now <b>{html_escape(status)}</b>."
             if kind == "item" else
-            f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(status)}</b>."
+            f"🔔 Update: Your order <b>{html_escape(rec.get('item'))}</b> is now <b>{html_escape(status)}</b>"
+            + (f" (Трек: {html_escape(tracking)})" if tracking else "")
+            + "."
         )
         try:
             bot.send_message(chat_id, msg, parse_mode="HTML")
