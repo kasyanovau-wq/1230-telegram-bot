@@ -72,33 +72,65 @@ load_data()
 def html_escape(s: str | None) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
+import re
+
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
+PHONE_RE_RAW = re.compile(r"^[+]?(\d[\s\-()]*){10,15}$")  # coarse: digits with optional + and separators
+
+def is_email(s: str | None) -> bool:
+    s = (s or "").strip()
+    return bool(EMAIL_RE.match(s))
+
+def is_phone(s: str | None) -> bool:
+    s = (s or "").strip()
+    if not PHONE_RE_RAW.match(s):
+        return False
+    # keep only digits and +
+    digits = re.sub(r"[^\d+]", "", s)
+    # Accept +7XXXXXXXXXX, 7XXXXXXXXXX, 8XXXXXXXXXX (RU)
+    if digits.startswith("+7") and len(digits) == 12:
+        return True
+    if digits.startswith("7") and len(digits) == 11:
+        return True
+    if digits.startswith("8") and len(digits) == 11:
+        return True
+    return False
+
 def normalize_email(s: str | None) -> str:
     return (s or "").strip().lower()
 
 def normalize_phone(s: str | None) -> str:
     s = (s or "").strip()
-    digits = re.sub(r"[^\d+]", "", s)  # keep digits and leading +
-    if digits.startswith("+"):
+    digits = re.sub(r"[^\d+]", "", s)
+    # Normalize to +7XXXXXXXXXX
+    if digits.startswith("+7") and len(digits) == 12:
         return digits
-    # RU-friendly heuristics
-    if re.fullmatch(r"8\d{10}", digits):   # 8XXXXXXXXXX -> +7XXXXXXXXXX
-        return "+7" + digits[1:]
-    if re.fullmatch(r"7\d{10}", digits):   # 7XXXXXXXXXX -> +7XXXXXXXXXX
+    if digits.startswith("7") and len(digits) == 11:
         return "+" + digits
-    if re.fullmatch(r"9\d{9}", digits):    # 9XXXXXXXXX  -> +7XXXXXXXXXX
-        return "+7" + digits
+    if digits.startswith("8") and len(digits) == 11:
+        return "+7" + digits[1:]
+    # fallback (don’t accept as valid phone elsewhere)
     return digits
 
 def link_chat(identifier: str, chat_id: int):
-    bundle = data_store.setdefault(identifier, {"items": {}, "orders": {}})
+    """Attach this ident to chat_id, but DO NOT unmap other idents.
+    A chat can have both email and phone; /status will aggregate."""
+    bundle = data_store.setdefault(identifier, {"items": {}, "orders": {}, "chat_id": chat_id})
     bundle["chat_id"] = chat_id
     save_data()
 
-def find_user_key_by_chat(chat_id: int):
-    for k, v in data_store.items():
-        if v.get("chat_id") == chat_id:
-            return k
-    return None
+def idents_for_chat(chat_id: int) -> list[str]:
+    """Return all identifiers (email/phone) mapped to this chat_id."""
+    return [k for k, v in data_store.items() if v.get("chat_id") == chat_id]
+
+def aggregate_status_for_chat(chat_id: int) -> dict:
+    """Union items/orders across all idents linked to this chat."""
+    items, orders = {}, {}
+    for ident in idents_for_chat(chat_id):
+        b = data_store.get(ident, {})
+        items.update(b.get("items", {}))
+        orders.update(b.get("orders", {}))
+    return {"items": items, "orders": orders}
 
 def build_status_lines(info: dict) -> list[str]:
     lines = []
@@ -144,26 +176,32 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    key = find_user_key_by_chat(chat_id)
-    if not key:
-        await update.message.reply_text("I don’t know you yet. Type your email (or /start to share phone).")
-        return
-    lines = build_status_lines(data_store.get(key, {}))
+    aggr = aggregate_status_for_chat(chat_id)
+    lines = build_status_lines(aggr)
     await (update.message.reply_html("\n".join(lines)) if lines else update.message.reply_text("No items or orders found yet."))
-
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = normalize_phone(update.message.contact.phone_number)
-    link_chat(phone, update.effective_chat.id)
-    await update.message.reply_text("✅ Phone linked. Send /status to see updates.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
-    if "@" in txt and "." in txt:
+    if is_email(txt):
         email = normalize_email(txt)
         link_chat(email, update.effective_chat.id)
         await update.message.reply_text(f"✅ Email {email} linked. Send /status to see updates.")
-    else:
-        await update.message.reply_text("Please send a valid email (like name@example.com) or use /start to share phone.")
+        return
+    if is_phone(txt):
+        phone = normalize_phone(txt)
+        link_chat(phone, update.effective_chat.id)
+        await update.message.reply_text(f"✅ Phone {phone} linked. Send /status to see updates.")
+        return
+    await update.message.reply_text("Please send a valid email (name@example.com) or phone (+7XXXXXXXXXX).")
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone_raw = update.message.contact.phone_number
+    if not is_phone(phone_raw):
+        await update.message.reply_text("That doesn’t look like a valid RU phone. Enter it like +7XXXXXXXXXX.")
+        return
+    phone = normalize_phone(phone_raw)
+    link_chat(phone, update.effective_chat.id)
+    await update.message.reply_text("✅ Phone linked. Send /status to see updates.")
 
 # register handlers
 app_tg.add_handler(CommandHandler("start", cmd_start))
@@ -191,33 +229,38 @@ def kv_find(data: dict, *needles: str):
     return None
 
 def upsert_from_payload(payload: dict):
-    # prefer email, then phone
-    k_email = kv_find(payload, "email"); k_phone = kv_find(payload, "phone")
-    ident = normalize_email(payload.get(k_email)) if (k_email and payload.get(k_email)) else \
-            normalize_phone(payload.get(k_phone)) if (k_phone and payload.get(k_phone)) else None
-    if not ident: return None, None, None
+    # explicit pick
+    email_key = next((k for k in payload.keys() if k.lower() in ("email","e-mail","почта")), None)
+    phone_key = next((k for k in payload.keys() if k.lower() in ("phone","телефон")), None)
 
-    # status: prefer 'Stage' (human), then 'status' family
+    ident = None
+    if email_key and is_email(payload.get(email_key)):
+        ident = normalize_email(payload[email_key])
+    elif phone_key and is_phone(payload.get(phone_key)):
+        ident = normalize_phone(payload[phone_key])
+    if not ident:
+        return None, None, None
+
+    # status: prefer human-friendly Stage; otherwise status
     status = None
-    for key in payload.keys():
-        if key.strip().lower() == "stage":
-            status = (payload.get(key) or "").strip()
+    for k in payload.keys():
+        if k.strip().lower() == "stage":
+            status = (payload.get(k) or "").strip()
             break
     if not status:
-        k_status = kv_find(payload, "status")
-        status = (payload.get(k_status) or "").strip() if k_status else "Submitted"
+        status_key = next((k for k in payload.keys() if "status" in k.lower()), None)
+        status = (payload.get(status_key) or "Submitted").strip() if status_key else "Submitted"
 
-    k_item   = kv_find(payload, "item") or kv_find(payload, "product")
-    k_order  = kv_find(payload, "order")  # order / orderid
-    item_name = payload.get(k_item) if k_item else None
-    order_id  = payload.get(k_order) if k_order else None
-    tranid    = payload.get("tranid") or payload.get("leadid") or payload.get("leads_id")
+    # item/order fields
+    item_key = next((k for k in payload.keys() if k.lower() in ("item","product","товар","наименование","название")), None)
+    order_key = next((k for k in payload.keys() if k.lower() in ("order","orderid","заказ","номер","id")), None)
 
-    kind = "item"
-    if k_order and not k_item:
-        kind = "order"
+    item_name = (payload.get(item_key) or "").strip() if item_key else ""
+    order_id  = (payload.get(order_key) or "").strip() if order_key else ""
+    tranid    = (payload.get("tranid") or payload.get("leadid") or payload.get("leads_id") or "").strip()
 
-    rec_id = (tranid or order_id or item_name or f"rec-{int(datetime.utcnow().timestamp())}").strip()
+    kind = "order" if (order_key and not item_key) else "item"
+    rec_id = tranid or order_id or item_name or f"rec-{int(datetime.utcnow().timestamp())}"
 
     bundle = data_store.setdefault(ident, {"items": {}, "orders": {}})
     if kind == "item":
@@ -285,16 +328,18 @@ def check_auth_header(req) -> bool:
     return req.headers.get("Authorization", "") == f"Bearer {AUTH_TOKEN}"
 
 def upsert_row(row: dict, kind: str, notify: bool):
-    # ---------- identify the user (email first, then phone) ----------
-    k_email = pick_key(row, CSV_EMAIL_KEYS)
-    k_phone = pick_key(row, CSV_PHONE_KEYS)
+    # ----- identify strictly by explicit columns -----
+    keys = {k.lower(): k for k in row.keys()}
+    k_email = next((keys[k] for k in keys if k in ("email","e-mail","почта")), None)
+    k_phone = next((keys[k] for k in keys if k in ("phone","телефон")), None)
+
     ident = None
-    if k_email and row.get(k_email):
+    if k_email and is_email(row.get(k_email)):
         ident = normalize_email(row[k_email])
-    elif k_phone and row.get(k_phone):
+    elif k_phone and is_phone(row.get(k_phone)):
         ident = normalize_phone(row[k_phone])
     if not ident:
-        return  # can't link to a chat later without an identifier
+        return
 
     # ---------- find fields in this CSV row ----------
     k_status   = pick_key(row, CSV_STATUS_KEYS)  # common aliases like "status", "статус"
