@@ -7,8 +7,8 @@ Original file is located at
     https://colab.research.google.com/drive/1Br1KHaNsVETs8ZpGah8VmaHxrcgHt_Hi
 """
 
-# app.py — hardened MVP (email-first, secure routes)
-import os, re, json, csv, io, asyncio, logging, threading
+# app.py — hardened MVP (email-first, secure routes) + peek/search/alias
+import os, re, json, csv, io, logging, threading
 from datetime import datetime
 from flask import Flask, request
 
@@ -31,6 +31,7 @@ if not AUTH_TOKEN:
 if not ADMIN_PATH:
     raise RuntimeError("ADMIN_PATH is required")
 
+# IMPORTANT: mount a Render disk at /data so this file persists across restarts
 DATA_FILE = os.environ.get("DATA_FILE", "/data/data.json")
 
 LOCK = threading.Lock()
@@ -59,6 +60,7 @@ def load_data():
 def save_data():
     with LOCK:
         try:
+            os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data_store, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -195,8 +197,15 @@ def upsert_from_payload(payload: dict):
             normalize_phone(payload.get(k_phone)) if (k_phone and payload.get(k_phone)) else None
     if not ident: return None, None, None
 
-    k_status = kv_find(payload, "status")
-    status = (payload.get(k_status) if k_status else None) or "Submitted"
+    # status: prefer 'Stage' (human), then 'status' family
+    status = None
+    for key in payload.keys():
+        if key.strip().lower() == "stage":
+            status = (payload.get(key) or "").strip()
+            break
+    if not status:
+        k_status = kv_find(payload, "status")
+        status = (payload.get(k_status) or "").strip() if k_status else "Submitted"
 
     k_item   = kv_find(payload, "item") or kv_find(payload, "product")
     k_order  = kv_find(payload, "order")  # order / orderid
@@ -208,7 +217,7 @@ def upsert_from_payload(payload: dict):
     if k_order and not k_item:
         kind = "order"
 
-    rec_id = tranid or order_id or item_name or f"rec-{int(datetime.utcnow().timestamp())}"
+    rec_id = (tranid or order_id or item_name or f"rec-{int(datetime.utcnow().timestamp())}").strip()
 
     bundle = data_store.setdefault(ident, {"items": {}, "orders": {}})
     if kind == "item":
@@ -359,7 +368,7 @@ def admin_import_csv():
     if kind not in {"item","order"}:
         return "bad type", 400
 
-    # basic size guard (~10MB)
+    # basic size guard (~10MB). For very large boards, split CSV and upload in parts.
     if "file" not in request.files:
         return "no file", 400
     f = request.files["file"]
@@ -404,6 +413,80 @@ def admin_import_csv():
         return f"error: {type(e).__name__}: {e}", 500
 
 app.add_url_rule(ADMIN_IMPORT_PATH, view_func=admin_import_csv, methods=["POST"])
+
+# -------- Peek / Search / Alias helpers (admin) --------
+@app.get(f"/admin/{ADMIN_PATH}/peek")
+def admin_peek():
+    if not check_auth_header(request):
+        return "forbidden", 403
+    ident_raw = (request.args.get("ident") or "").strip()
+    if not ident_raw:
+        return "missing ident", 400
+
+    ident = normalize_email(ident_raw) if "@" in ident_raw else normalize_phone(ident_raw)
+    bundle = data_store.get(ident)
+    if not bundle:
+        return {"ident": ident, "found": False}, 200
+
+    items = bundle.get("items", {})
+    orders = bundle.get("orders", {})
+    return {
+        "ident": ident,
+        "found": True,
+        "chat_id": bundle.get("chat_id"),
+        "counts": {"items": len(items), "orders": len(orders)},
+        "samples": {
+            "items": list(items.values())[:3],
+            "orders": list(orders.values())[:3],
+        }
+    }, 200
+
+@app.get(f"/admin/{ADMIN_PATH}/search")
+def admin_search():
+    if not check_auth_header(request):
+        return "forbidden", 403
+    q = (request.args.get("q") or "").strip().lower()
+    out = []
+    for k, v in data_store.items():
+        if q in k.lower():
+            out.append({
+                "ident": k,
+                "chat_id": v.get("chat_id"),
+                "items": len(v.get("items", {})),
+                "orders": len(v.get("orders", {}))
+            })
+            if len(out) >= 50:
+                break
+    return {"results": out}, 200
+
+@app.post(f"/admin/{ADMIN_PATH}/alias")
+def admin_alias():
+    if not check_auth_header(request):
+        return "forbidden", 403
+    src_raw = (request.form.get("from") or "").strip()
+    dst_raw = (request.form.get("to") or "").strip()
+    if not src_raw or not dst_raw:
+        return "missing params", 400
+
+    def norm(x):
+        return normalize_email(x) if "@" in x else normalize_phone(x)
+
+    src = norm(src_raw)
+    dst = norm(dst_raw)
+    if src not in data_store:
+        return {"moved": False, "reason": "source not found", "src": src}, 404
+
+    dst_bundle = data_store.setdefault(dst, {"items": {}, "orders": {}})
+    sb = data_store[src]
+    dst_bundle["items"].update(sb.get("items", {}))
+    dst_bundle["orders"].update(sb.get("orders", {}))
+    if not dst_bundle.get("chat_id") and sb.get("chat_id"):
+        dst_bundle["chat_id"] = sb.get("chat_id")
+
+    del data_store[src]
+    save_data()
+    return {"moved": True, "from": src, "to": dst,
+            "dst_counts": {"items": len(dst_bundle["items"]), "orders": len(dst_bundle["orders"])}}, 200
 
 # -------- run (Flask in thread, bot in main) --------
 def run_flask():
